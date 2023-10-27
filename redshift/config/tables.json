@@ -1,0 +1,9 @@
+[
+  {
+    "db":"dev",
+    "table":"us_daily",
+    "primary_key":"hash",
+    "timestamp.fields": [],
+    "precombine_key": ""
+  }
+]
