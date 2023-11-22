@@ -28,7 +28,7 @@ CUSTOM_PLUGIN_ARN=$(aws kafkaconnect create-custom-plugin --content-type ZIP --n
     --location "{\"s3Location\": {\"bucketArn\":\"arn:aws:s3:::$S3_BUCKET_NAME\",\"fileKey\": \"debezium-debezium-connector-mysql-1.9.7.zip\"}}" \
     | jq --raw-output '.customPluginArn')
 
-echo "Craete custom plugin success."
+echo "Create custom plugin success."
 
 # Create MSK Connect Configuration
 cat | base64 > connect-configuration.properties <<EOF
