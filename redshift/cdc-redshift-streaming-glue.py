@@ -11,6 +11,11 @@ from urllib.parse import urlparse
 import boto3
 from pyspark.sql.functions import col, from_json, schema_of_json, to_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, LongType
+import re
+
+def is_valid_identifier(identifier):
+    """验证SQL标识符是否合法（仅允许字母、数字和下划线）"""
+    return bool(re.match(r'^[a-zA-Z0-9_]+$', identifier))
 
 '''
 RDS(CDC) -> Kafka -> Redshift [Glue Streaming]
@@ -80,7 +85,7 @@ STARTING_OFFSETS_OF_KAFKA_TOPIC = args.get('starting_offsets_of_kafka_topic', 'l
 REDSHIFT_CONNECT = args.get('redshift_connect')
 # REDSHIFT_TABLE = args.get('redshift_table')
 TMPDIR = args.get('redshift_tmpdir')
-REDSHIFT_TMPDIR = TMPDIR + "/tmp/"
+REDSHIFT_TMPDIR = TMPDIR + "/redshift_glue/"
 REDSHIFT_IAM_ROLE = args.get('redshift_iam_role')
 KAFKA_DB = args.get('glue_database_kafka')
 KAFKA_TABLENAME = args.get('glue_table_kafka')
@@ -277,40 +282,46 @@ def MergeIntoDataLake(tableName, dataFrame):
     schemaName = "public"
     tempTableName = "vdp_test_temp_b92724"
 
-    if precombine_key == '':
-        postactionsSql = f"""BEGIN;
-        MERGE INTO {schemaName}.{tableName} USING {schemaName}.{tempTableName} u
-            ON {schemaName}.{tableName}.{primary_key} = u.{primary_key}
-            WHEN MATCHED THEN UPDATE SET {updatecolumns}
-            WHEN NOT MATCHED THEN INSERT VALUES({insertcolumns});
-        DROP TABLE {schemaName}.{tempTableName};
-        END;"""
+    if (is_valid_identifier(schemaName) and
+            is_valid_identifier(tableName) and
+            is_valid_identifier(tempTableName) and
+            is_valid_identifier(primary_key)):
+
+        if precombine_key == '':
+            postactionsSql = f"""BEGIN;
+            MERGE INTO {schemaName}.{tableName} USING {schemaName}.{tempTableName} u
+                ON {schemaName}.{tableName}.{primary_key} = u.{primary_key}
+                WHEN MATCHED THEN UPDATE SET {updatecolumns}
+                WHEN NOT MATCHED THEN INSERT VALUES({insertcolumns});
+            DROP TABLE {schemaName}.{tempTableName};
+            END;"""
+        else:
+            postactionsSql = f"""BEGIN;
+                    MERGE INTO {schemaName}.{tableName} USING 
+                        (SELECT a.* FROM {schemaName}.{tempTableName} a join (SELECT {primary_key},max({precombine_key}) as {precombine_key} from {schemaName}.{tempTableName} group by {primary_key}) b on
+                            a.{primary_key} = b.{primary_key} and a.{precombine_key} = b.{precombine_key}) u
+                            ON {schemaName}.{tableName}.{primary_key} = u.{primary_key}
+                            WHEN MATCHED THEN UPDATE SET {updatecolumns}
+                            WHEN NOT MATCHED THEN INSERT VALUES({insertcolumns});
+                            DROP TABLE {schemaName}.{tempTableName}; END;"""
+        writeJobLogger("Update-SQL:{}".format(postactionsSql))
+        AmazonRedshift_MergeInto = glueContext.write_dynamic_frame.from_options(
+            frame=redshiftWriteDF,
+            connection_type="redshift",
+            connection_options={
+                "postactions": postactionsSql,
+                "redshiftTmpDir": REDSHIFT_TMPDIR,
+                "useConnectionProperties": "true",
+                "dbtable": f"{schemaName}.{tempTableName}",
+                "connectionName": REDSHIFT_CONNECT,
+                "aws_iam_role":  REDSHIFT_IAM_ROLE
+            },
+            transformation_ctx="AmazonRedshift_MergeInto",
+        )
+
+        writeJobLogger("Upsert Success. Upsert Record Count [{}]".format(dataFrame.count()))
     else:
-        postactionsSql = f"""BEGIN;
-                MERGE INTO {schemaName}.{tableName} USING 
-                    (SELECT a.* FROM {schemaName}.{tempTableName} a join (SELECT {primary_key},max({precombine_key}) as {precombine_key} from {schemaName}.{tempTableName} group by {primary_key}) b on
-                        a.{primary_key} = b.{primary_key} and a.{precombine_key} = b.{precombine_key}) u
-                        ON {schemaName}.{tableName}.{primary_key} = u.{primary_key}
-                        WHEN MATCHED THEN UPDATE SET {updatecolumns}
-                        WHEN NOT MATCHED THEN INSERT VALUES({insertcolumns});
-                        DROP TABLE {schemaName}.{tempTableName}; END;"""
-    writeJobLogger("Update-SQL:{}".format(postactionsSql))
-    AmazonRedshift_MergeInto = glueContext.write_dynamic_frame.from_options(
-        frame=redshiftWriteDF,
-        connection_type="redshift",
-        connection_options={
-            "postactions": postactionsSql,
-            "redshiftTmpDir": REDSHIFT_TMPDIR,
-            "useConnectionProperties": "true",
-            "dbtable": f"{schemaName}.{tempTableName}",
-            "connectionName": REDSHIFT_CONNECT,
-            "aws_iam_role":  REDSHIFT_IAM_ROLE
-        },
-        transformation_ctx="AmazonRedshift_MergeInto",
-    )
-
-    writeJobLogger("Upsert Success. Upsert Record Count [{}]".format(dataFrame.count()))
-
+        raise ValueError("Invalid identifier detected")
 
 ##Delete
 def DeleteDataFromDataLake(tableName, dataFrame):
