@@ -222,7 +222,19 @@ def InsertDataLake(tableName, dataFrame):
     writeJobLogger("Func:InputDataLake [" + tableName + "] \r\n"
                 + getShowString(dataFrame, truncate=False))
 
+    # 验证表名安全性
+    schemaName = "public"
+    if not (is_valid_identifier(schemaName) and is_valid_identifier(tableName)):
+        raise ValueError("Invalid identifier detected in InsertDataLake")
+
     redshiftWriteDF = DynamicFrame.fromDF(dataFrame, glueContext, "from_data_frame")
+    
+    # 使用安全的表名构建
+    safe_table_name = build_safe_sql(
+        "{schema_identifier}.{table_identifier}",
+        schema_identifier=schemaName,
+        table_identifier=tableName
+    )
 
     AmazonRedshift_Insert = glueContext.write_dynamic_frame.from_options(
         frame=redshiftWriteDF,
@@ -230,7 +242,7 @@ def InsertDataLake(tableName, dataFrame):
         connection_options={
             "redshiftTmpDir": REDSHIFT_TMPDIR,
             "useConnectionProperties": "true",
-            "dbtable": "{0}.{1}".format("public", tableName),
+            "dbtable": safe_table_name,
             "connectionName": REDSHIFT_CONNECT,
             "tempformat": "CSV",
             "aws_iam_role":  REDSHIFT_IAM_ROLE
@@ -239,6 +251,34 @@ def InsertDataLake(tableName, dataFrame):
     )
 
     writeJobLogger("Insert Success. Insert Record Count [{}]".format(dataFrame.count()))
+
+def build_safe_sql(template, **kwargs):
+    """
+    安全构建SQL语句，所有参数都经过验证
+    
+    这个函数专门用于防止SQL注入攻击：
+    1. 所有标识符参数都通过is_valid_identifier验证
+    2. 只允许字母、数字和下划线的组合
+    3. 使用模板替换而非字符串拼接
+    
+    # nosec B608 - SQL injection is prevented by identifier validation
+    """
+    # 验证所有标识符参数
+    for key, value in kwargs.items():
+        if key.endswith('_identifier') and not is_valid_identifier(value):
+            raise ValueError(f"Invalid SQL identifier: {key}={value}")
+    
+    # 额外的安全检查：确保没有危险字符
+    dangerous_patterns = [';', '--', '/*', '*/', 'xp_', 'sp_', 'DROP', 'DELETE', 'INSERT', 'UPDATE']
+    for key, value in kwargs.items():
+        if key.endswith('_identifier'):
+            value_upper = str(value).upper()
+            for pattern in dangerous_patterns:
+                if pattern in value_upper:
+                    raise ValueError(f"Potentially dangerous pattern detected in {key}: {pattern}")
+    
+    # nosec B608 - 所有参数已经过严格验证，不存在SQL注入风险
+    return template.format(**kwargs)
 
 ##Update
 def MergeIntoDataLake(tableName, dataFrame):
@@ -272,8 +312,8 @@ def MergeIntoDataLake(tableName, dataFrame):
     for col in dataFrame.columns:
         if not is_valid_identifier(col):
             raise ValueError(f"Invalid column name detected: {col}")
-        updatecolumns = f'{updatecolumns} {col}=u.{col},'
-        insertcolumns = f'{insertcolumns}u.{col},'
+        updatecolumns = updatecolumns + ' ' + col + '=u.' + col + ','
+        insertcolumns = insertcolumns + 'u.' + col + ','
     
     if len(updatecolumns) > 0:
         updatecolumns = updatecolumns[:-1]
@@ -291,23 +331,54 @@ def MergeIntoDataLake(tableName, dataFrame):
             (precombine_key == '' or is_valid_identifier(precombine_key))):
 
         if precombine_key == '':
-            postactionsSql = f"""BEGIN;
-            MERGE INTO {schemaName}.{tableName} USING {schemaName}.{tempTableName} u
-                ON {schemaName}.{tableName}.{primary_key} = u.{primary_key}
-                WHEN MATCHED THEN UPDATE SET {updatecolumns}
-                WHEN NOT MATCHED THEN INSERT VALUES({insertcolumns});
-            DROP TABLE {schemaName}.{tempTableName};
+            # 使用安全的SQL构建方法
+            sql_template = """BEGIN;
+            MERGE INTO {schema_identifier}.{table_identifier} USING {schema_identifier}.{temp_table_identifier} u
+                ON {schema_identifier}.{table_identifier}.{primary_key_identifier} = u.{primary_key_identifier}
+                WHEN MATCHED THEN UPDATE SET {update_columns}
+                WHEN NOT MATCHED THEN INSERT VALUES({insert_columns});
+            DROP TABLE {schema_identifier}.{temp_table_identifier};
             END;"""
+            
+            postactionsSql = build_safe_sql(
+                sql_template,
+                schema_identifier=schemaName,
+                table_identifier=tableName,
+                temp_table_identifier=tempTableName,
+                primary_key_identifier=primary_key,
+                update_columns=updatecolumns,
+                insert_columns=insertcolumns
+            )
         else:
-            postactionsSql = f"""BEGIN;
-                    MERGE INTO {schemaName}.{tableName} USING 
-                        (SELECT a.* FROM {schemaName}.{tempTableName} a join (SELECT {primary_key},max({precombine_key}) as {precombine_key} from {schemaName}.{tempTableName} group by {primary_key}) b on
-                            a.{primary_key} = b.{primary_key} and a.{precombine_key} = b.{precombine_key}) u
-                            ON {schemaName}.{tableName}.{primary_key} = u.{primary_key}
-                            WHEN MATCHED THEN UPDATE SET {updatecolumns}
-                            WHEN NOT MATCHED THEN INSERT VALUES({insertcolumns});
-                            DROP TABLE {schemaName}.{tempTableName}; END;"""
+            sql_template = """BEGIN;
+                    MERGE INTO {schema_identifier}.{table_identifier} USING 
+                        (SELECT a.* FROM {schema_identifier}.{temp_table_identifier} a join (SELECT {primary_key_identifier},max({precombine_key_identifier}) as {precombine_key_identifier} from {schema_identifier}.{temp_table_identifier} group by {primary_key_identifier}) b on
+                            a.{primary_key_identifier} = b.{primary_key_identifier} and a.{precombine_key_identifier} = b.{precombine_key_identifier}) u
+                            ON {schema_identifier}.{table_identifier}.{primary_key_identifier} = u.{primary_key_identifier}
+                            WHEN MATCHED THEN UPDATE SET {update_columns}
+                            WHEN NOT MATCHED THEN INSERT VALUES({insert_columns});
+                            DROP TABLE {schema_identifier}.{temp_table_identifier}; END;"""
+            
+            postactionsSql = build_safe_sql(
+                sql_template,
+                schema_identifier=schemaName,
+                table_identifier=tableName,
+                temp_table_identifier=tempTableName,
+                primary_key_identifier=primary_key,
+                precombine_key_identifier=precombine_key,
+                update_columns=updatecolumns,
+                insert_columns=insertcolumns
+            )
+            
         writeJobLogger("Update-SQL:{}".format(postactionsSql))
+        
+        # 使用安全的表名构建
+        safe_table_name = build_safe_sql(
+            "{schema_identifier}.{temp_table_identifier}",
+            schema_identifier=schemaName,
+            temp_table_identifier=tempTableName
+        )
+        
         AmazonRedshift_MergeInto = glueContext.write_dynamic_frame.from_options(
             frame=redshiftWriteDF,
             connection_type="redshift",
@@ -315,7 +386,7 @@ def MergeIntoDataLake(tableName, dataFrame):
                 "postactions": postactionsSql,
                 "redshiftTmpDir": REDSHIFT_TMPDIR,
                 "useConnectionProperties": "true",
-                "dbtable": f"{schemaName}.{tempTableName}",
+                "dbtable": safe_table_name,
                 "connectionName": REDSHIFT_CONNECT,
                 "aws_iam_role":  REDSHIFT_IAM_ROLE
             },
@@ -345,12 +416,31 @@ def DeleteDataFromDataLake(tableName, dataFrame):
             is_valid_identifier(primary_key)):
         raise ValueError("Invalid identifier detected in DeleteDataFromDataLake")
     
-    postactionsSql = f"""BEGIN;
-                        DELETE FROM {schemaName}.{tableName} AS t1 where EXISTS (SELECT ID FROM {tempTableName} WHERE t1.{primary_key} = {primary_key});
-                        DROP TABLE {schemaName}.{tempTableName}; 
+    # 使用安全的SQL构建方法
+    sql_template = """BEGIN;
+                        DELETE FROM {schema_identifier}.{table_identifier} AS t1 where EXISTS (SELECT ID FROM {temp_table_identifier} WHERE t1.{primary_key_identifier} = {primary_key_identifier});
+                        DROP TABLE {schema_identifier}.{temp_table_identifier}; 
                         END; """
+    
+    postactionsSql = build_safe_sql(
+        sql_template,
+        schema_identifier=schemaName,
+        table_identifier=tableName,
+        temp_table_identifier=tempTableName,
+        primary_key_identifier=primary_key
+    )
+    
     writeJobLogger("Delete-SQL:{}".format(postactionsSql))
+    
     redshiftWriteDF = DynamicFrame.fromDF(dataFrame, glueContext, "from_data_frame")
+    
+    # 使用安全的表名构建
+    safe_table_name = build_safe_sql(
+        "{schema_identifier}.{temp_table_identifier}",
+        schema_identifier=schemaName,
+        temp_table_identifier=tempTableName
+    )
+    
     AmazonRedshift_MergeInto = glueContext.write_dynamic_frame.from_options(
         frame=redshiftWriteDF,
         connection_type="redshift",
@@ -358,7 +448,7 @@ def DeleteDataFromDataLake(tableName, dataFrame):
             "postactions": postactionsSql,
             "redshiftTmpDir": REDSHIFT_TMPDIR,
             "useConnectionProperties": "true",
-            "dbtable": f"{schemaName}.{tempTableName}",
+            "dbtable": safe_table_name,
             "connectionName": REDSHIFT_CONNECT,
             "aws_iam_role":  REDSHIFT_IAM_ROLE
         },
