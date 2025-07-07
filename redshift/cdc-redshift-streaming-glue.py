@@ -266,10 +266,12 @@ def MergeIntoDataLake(tableName, dataFrame):
                 dataFrame = dataFrame.withColumn(cols.name, to_timestamp(col(cols.name)))
                 writeJobLogger("CovertTimeColumn:" + cols.name)
 
-    # cols
+    # cols - validate column names to prevent SQL injection
     updatecolumns = ''
     insertcolumns = ''
     for col in dataFrame.columns:
+        if not is_valid_identifier(col):
+            raise ValueError(f"Invalid column name detected: {col}")
         updatecolumns = f'{updatecolumns} {col}=u.{col},'
         insertcolumns = f'{insertcolumns}u.{col},'
     
@@ -285,7 +287,8 @@ def MergeIntoDataLake(tableName, dataFrame):
     if (is_valid_identifier(schemaName) and
             is_valid_identifier(tableName) and
             is_valid_identifier(tempTableName) and
-            is_valid_identifier(primary_key)):
+            is_valid_identifier(primary_key) and
+            (precombine_key == '' or is_valid_identifier(precombine_key))):
 
         if precombine_key == '':
             postactionsSql = f"""BEGIN;
@@ -331,8 +334,17 @@ def DeleteDataFromDataLake(tableName, dataFrame):
     for item in tables_ds:
         if item['table'] == tableName:
             primary_key = item['primary_key']
+    
     schemaName = "public"
     tempTableName = "tmp_" + tableName + "_delete"
+    
+    # Validate all identifiers to prevent SQL injection
+    if not (is_valid_identifier(schemaName) and
+            is_valid_identifier(tableName) and
+            is_valid_identifier(tempTableName) and
+            is_valid_identifier(primary_key)):
+        raise ValueError("Invalid identifier detected in DeleteDataFromDataLake")
+    
     postactionsSql = f"""BEGIN;
                         DELETE FROM {schemaName}.{tableName} AS t1 where EXISTS (SELECT ID FROM {tempTableName} WHERE t1.{primary_key} = {primary_key});
                         DROP TABLE {schemaName}.{tempTableName}; 

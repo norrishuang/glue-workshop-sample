@@ -31,7 +31,7 @@ CUSTOM_PLUGIN_ARN=$(aws kafkaconnect create-custom-plugin --content-type ZIP --n
 echo "Create custom plugin success."
 
 # Create MSK Connect Configuration
-cat | base64 > connect-configuration.properties <<EOF
+base64 > connect-configuration.properties <<EOF
 key.converter=org.apache.kafka.connect.storage.StringConverter
 key.converter.schemas.enable=false
 value.converter=org.apache.kafka.connect.json.JsonConverter
